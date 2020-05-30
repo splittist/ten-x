@@ -1,0 +1,523 @@
+#+TITLE TEN-X - An Example of Document Assembly in Common Lisp
+
+* Introduction
+
+We're going to try to extend/repurpose Mario Montone's [[https://github.com/mmontone/ten][TEN]] templating system to work with Microsoft Word documents. We would like the user to be able to compose their templates in Word (or their favourite ~docx~-compatible WYSIWYG word processor, where ~docx~ is the file extension for Word documents), and we would like the rendered templates to be valid Word documents with all the formatting applied in the template retained appropriately.
+
+For example, we should be able to take a contract written in Word and mark it up with TEN constructs to allow us to use it in mulitiple contexts. More simply, the following Word document:
+
+{% template dunning-letter () (deadbeat sum-owed) %}
+Dear {{ deadbeat }},
+
+You owe us{% if (> sum-owed 100) %} *a lot of* {% else %} some {% end %}money. Pay up.
+
+/The Management/
+{% end %}
+
+when compiled as a template and rendered with various arguments should yield the expected ~docx~ file. (We may find we have to tweak the syntax, add an option or two etc.)
+
+This capability is known as 'document assembly' or '[[https://en.wikipedia.org/wiki/Document_automation][document automation]]'.
+
+* TEN
+
+TEN compiles strings to lisp code which takes arguments and emits a string. Let's have a quick look at how it works. (We can delve into more detail as necessary once we understand what we might need to change.)
+
+If we call ~TEN:EXPAND-TEMPLATE~ with the following string:
+
+#+BEGIN_EXAMPLE
+{% template foo () (bar) %}
+Here is the first line.
+{% case bar %}
+{% :one %}One thing.{% end %}
+{% :two %}Second thing.{% end %}
+{% t %}Default thing.{%end %}
+{% end %}
+And now bar: {{ bar }}
+{% end %}
+#+END_EXAMPLE
+
+we get this form:
+
+#+BEGIN_SRC lisp
+((TEMPLATE TEN-TEMPLATES::FOO NIL (TEN-TEMPLATES::BAR)
+           (WRITE-STRING "
+Here is the first line.
+"
+                         TEN/TEMPLATE:%TEN-STREAM)
+           (CASE TEN-TEMPLATES::BAR
+             (WRITE-STRING
+              "
+"
+              TEN/TEMPLATE:%TEN-STREAM)
+             (:ONE (WRITE-STRING "One thing." TEN/TEMPLATE:%TEN-STREAM))
+             (WRITE-STRING
+              "
+"
+              TEN/TEMPLATE:%TEN-STREAM)
+             (:TWO (WRITE-STRING "Second thing." TEN/TEMPLATE:%TEN-STREAM))
+             (WRITE-STRING
+              "
+"
+              TEN/TEMPLATE:%TEN-STREAM)
+             (T (WRITE-STRING "Default thing." TEN/TEMPLATE:%TEN-STREAM))
+             (WRITE-STRING
+              "
+"
+              TEN/TEMPLATE:%TEN-STREAM))
+           (WRITE-STRING "
+And now bar: "
+                         TEN/TEMPLATE:%TEN-STREAM)
+           (MULTIPLE-VALUE-BIND (#:OUT859 #:RAW860)
+               TEN-TEMPLATES::BAR
+             (IF #:RAW860
+                 (PRINC #:OUT859 TEN/TEMPLATE:%TEN-STREAM)
+                 (WRITE-STRING (ESC (PRINC-TO-STRING #:OUT859))
+                               TEN/TEMPLATE:%TEN-STREAM)))
+           (WRITE-STRING "
+"
+                         TEN/TEMPLATE:%TEN-STREAM)))
+#+END_SRC
+
+Interesting things to note:
+
+- the initial ~#\Newline~ after the ~template~ form is output
+- the ~#\Newline~ s in the ~CASE~ form render it invalid
+- ~BAR~ is checked to see if it needs escaping (by ~ESC~).
+
+We can fix the ~#\Newline~ issue by adding an ~:output-whitespace nil~ option, as recommended by the fine documentation.
+
+#+BEGIN_EXAMPLE
+{% template foo (:output-whitespace nil) (bar) %}
+Here is the first line.
+{% case bar %}
+{% :one %}One thing.{% end %}
+{% :two %}Second thing.{% end %}
+{% t %}Default thing.{%end %}
+{% end %}
+And now bar: {{ bar }}
+{% end %}
+#+END_EXAMPLE
+
+When expanded, we get the much cleaner:
+
+#+BEGIN_SRC lisp
+((TEMPLATE TEN-TEMPLATES::FOO (:OUTPUT-WHITESPACE NIL) (TEN-TEMPLATES::BAR)
+           (WRITE-STRING "
+Here is the first line.
+"
+                         TEN/TEMPLATE:%TEN-STREAM)
+           (CASE TEN-TEMPLATES::BAR
+             (:ONE (WRITE-STRING "One thing." TEN/TEMPLATE:%TEN-STREAM))
+             (:TWO (WRITE-STRING "Second thing." TEN/TEMPLATE:%TEN-STREAM))
+             (T (WRITE-STRING "Default thing." TEN/TEMPLATE:%TEN-STREAM)))
+           (WRITE-STRING "
+And now bar: "
+                         TEN/TEMPLATE:%TEN-STREAM)
+           (MULTIPLE-VALUE-BIND (#:OUT861 #:RAW862)
+               TEN-TEMPLATES::BAR
+             (IF #:RAW862
+                 (PRINC #:OUT861 TEN/TEMPLATE:%TEN-STREAM)
+                 (WRITE-STRING (ESC (PRINC-TO-STRING #:OUT861))
+                               TEN/TEMPLATE:%TEN-STREAM)))))
+#+END_SRC
+
+Macro-expanding the first element of the above, we can see what compiling a template does.
+
+#+BEGIN_SRC lisp
+(PROGN
+ (DEFCLASS TEN-TEMPLATES::FOO (TEMPLATE) ((TEN-TEMPLATES::BAR :INITARG :BAR)))
+ (DEFMETHOD TEN/TEMPLATE::RENDER-TEMPLATE
+            ((TEN/TEMPLATE::%TEN-TEMPLATE TEN-TEMPLATES::FOO)
+             TEN/TEMPLATE:%TEN-STREAM)
+   (WITH-SLOTS (TEN-TEMPLATES::BAR)
+       TEN/TEMPLATE::%TEN-TEMPLATE
+     (ACCESS:WITH-DOT NIL
+       (WRITE-STRING "
+Here is the first line.
+"
+                     TEN/TEMPLATE:%TEN-STREAM)
+       (CASE TEN-TEMPLATES::BAR
+         (:ONE (WRITE-STRING "One thing." TEN/TEMPLATE:%TEN-STREAM))
+         (:TWO (WRITE-STRING "Second thing." TEN/TEMPLATE:%TEN-STREAM))
+         (T (WRITE-STRING "Default thing." TEN/TEMPLATE:%TEN-STREAM)))
+       (WRITE-STRING "
+And now bar: "
+                     TEN/TEMPLATE:%TEN-STREAM)
+       (MULTIPLE-VALUE-BIND (#:OUT861 #:RAW862)
+           TEN-TEMPLATES::BAR
+         (IF #:RAW862
+             (PRINC #:OUT861 TEN/TEMPLATE:%TEN-STREAM)
+             (WRITE-STRING (ESC (PRINC-TO-STRING #:OUT861))
+                           TEN/TEMPLATE:%TEN-STREAM))))))
+ (DEFUN TEN-TEMPLATES::FOO (TEN-TEMPLATES::BAR)
+   (LET ((TEN/TEMPLATE::%TEN-TEMPLATE
+          (MAKE-INSTANCE 'TEN-TEMPLATES::FOO :BAR TEN-TEMPLATES::BAR)))
+     (VALUES
+      (WITH-OUTPUT-TO-STRING (TEN/TEMPLATE:%TEN-STREAM)
+        (TEN/TEMPLATE::RENDER-TEMPLATE TEN/TEMPLATE::%TEN-TEMPLATE
+                                       TEN/TEMPLATE:%TEN-STREAM))
+      T)))
+ (COMPILE 'TEN-TEMPLATES::FOO)
+ (EXPORT 'TEN-TEMPLATES::FOO (SYMBOL-PACKAGE 'TEN-TEMPLATES::FOO)))
+#+END_SRC
+
+- First, a class (named ~FOO~ after our template) is created which holds the template variables (in our case ~BAR~, or ~TEN-TEMPLATES::BAR~ if we're being formal). 
+- Then a method specialised on this new class is added to the generic function ~RENDER-TEMPLATE~ which does the work of running of the logic and writing to a stream. 
+- A (non-generic) function (also named ~FOO~) is defined using the lambda-list we gave to the ~TEMPLATE~ form which creates the class and calls ~RENDER~ with a string-output-stream, returning the resulting string and ~T~ (as values). 
+- Finally, ~FOO~ is compiled, and the symbol ~FOO~ is exported from the ~TEN-TEMPLATES~ package.
+
+That's probably all we need to know for now. Now let's look at the other half of the equation --- Microsoft Word Documents.
+
+* OOXML and OPC
+
+Microsoft Word documents are actually combinations of files stored as an [[https://en.wikipedia.org/wiki/Open_Packaging_Conventions][Open Packing Conventions]] container. Most of the interesting files ('parts') are XML files, written in WordprocessingML, one of the [[https://en.wikipedia.org/wiki/Office_Open_XML][Office Open XML]] dialects. Both OPC and OOXML are ECMA and ISO/IEC standards, and are accessed and generated by many applications and libraries. We'll be using the [[https://github.com/splittist/docxplora][docxplora]] library.
+
+** OPC
+
+The version of OPC used in ~docx~ files uses a ZIP archive. A fresh document containing our 'foo' template from above contains (on the day that I happened to write this sentence: Microsoft does like to keep Word continuously updating...) these parts:
+
+#+BEGIN_EXAMPLE
+/docProps/app.xml
+/docProps/core.xml
+/word/fontTable.xml
+/word/webSettings.xml
+/word/styles.xml
+/word/settings.xml
+/word/theme/theme1.xml
+/word/_rels/document.xml.rels
+/word/document.xml
+/_rels/.rels
+/[Content_Types].xml
+#+END_EXAMPLE
+
+The ~xml~ parts contain, unsurprisingly, XML of various flavours. The ~_rels/*.rels~ parts are a mechanism of allowing parts to refer to one another with a layer of indirection, while giving a type to the relevant relationship. If the document contained pictures, there would be ~jpg~, ~png~ or similar parts. And so on for other types of media. Similarly, a document with headers and footers, endnotes, automatic numbering etc. would contain more and different parts. But we'll get to that. You may well be thinking this is more than enough for a simple "Hello template" example...
+
+** WordprocessingML
+
+If we look in the ~/word/document.xml~ file, we find --- *OH MY G_D!!*:
+
+#+BEGIN_SRC xml -n -r
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document
+    xmlns:wpc="http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas"
+    xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex"
+    xmlns:cx1="http://schemas.microsoft.com/office/drawing/2015/9/8/chartex"
+    xmlns:cx2="http://schemas.microsoft.com/office/drawing/2015/10/21/chartex"
+    xmlns:cx3="http://schemas.microsoft.com/office/drawing/2016/5/9/chartex"
+    xmlns:cx4="http://schemas.microsoft.com/office/drawing/2016/5/10/chartex"
+    xmlns:cx5="http://schemas.microsoft.com/office/drawing/2016/5/11/chartex"
+    xmlns:cx6="http://schemas.microsoft.com/office/drawing/2016/5/12/chartex"
+    xmlns:cx7="http://schemas.microsoft.com/office/drawing/2016/5/13/chartex"
+    xmlns:cx8="http://schemas.microsoft.com/office/drawing/2016/5/14/chartex"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    xmlns:aink="http://schemas.microsoft.com/office/drawing/2016/ink"
+    xmlns:am3d="http://schemas.microsoft.com/office/drawing/2017/model3d"
+    xmlns:o="urn:schemas-microsoft-com:office:office"
+    xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"
+    xmlns:v="urn:schemas-microsoft-com:vml"
+    xmlns:wp14="http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing"
+    xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+    xmlns:w10="urn:schemas-microsoft-com:office:word"
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"
+    xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml"
+    xmlns:w16cex="http://schemas.microsoft.com/office/word/2018/wordml/cex"
+    xmlns:w16cid="http://schemas.microsoft.com/office/word/2016/wordml/cid"
+    xmlns:w16="http://schemas.microsoft.com/office/word/2018/wordml"
+    xmlns:w16se="http://schemas.microsoft.com/office/word/2015/wordml/symex"
+    xmlns:wpg="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup"
+    xmlns:wpi="http://schemas.microsoft.com/office/word/2010/wordprocessingInk"
+    xmlns:wne="http://schemas.microsoft.com/office/word/2006/wordml"
+    xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" mc:Ignorable="w14 w15 w16se w16cid w16 w16cex wp14">
+    <w:body>
+        <w:p w14:paraId="375C8F08" w14:textId="77777777" w:rsidR="00265260" w:rsidRPr="00265260" w:rsidRDefault="00265260" w:rsidP="00265260">
+            <w:pPr>
+                <w:rPr>
+                    <w:lang w:val="en-NZ"/>
+                </w:rPr>
+            </w:pPr>
+            <w:r w:rsidRPr="00265260">
+                <w:rPr>
+                    <w:lang w:val="en-NZ"/>
+                </w:rPr>
+                <w:t xml:space="preserve">{% template foo </w:t>
+            </w:r>
+            <w:proofErr w:type="gramStart"/>
+            <w:r w:rsidRPr="00265260">
+                <w:rPr>
+                    <w:lang w:val="en-NZ"/>
+                </w:rPr>
+                <w:t>(:output</w:t>
+            </w:r>
+            <w:proofErr w:type="gramEnd"/>
+            <w:r w:rsidRPr="00265260">
+                <w:rPr>
+                    <w:lang w:val="en-NZ"/>
+                </w:rPr>
+                <w:t>-whitespace nil) (bar) %}</w:t>
+            </w:r>
+        </w:p>
+        <w:p w14:paraId="74E80510" w14:textId="77777777" w:rsidR="00265260" w:rsidRPr="00265260" w:rsidRDefault="00265260" w:rsidP="00265260">
+            <w:pPr>
+                <w:rPr>
+                    <w:lang w:val="en-NZ"/>
+                </w:rPr>
+            </w:pPr>
+            <w:r w:rsidRPr="00265260">
+                <w:rPr>
+                    <w:lang w:val="en-NZ"/>
+                </w:rPr>
+                <w:t>Here is the first line.</w:t>
+            </w:r>
+        </w:p>
+        <w:p w14:paraId="04172AE1" w14:textId="77777777" w:rsidR="00265260" w:rsidRPr="00265260" w:rsidRDefault="00265260" w:rsidP="00265260">
+            <w:pPr>
+                <w:rPr>
+                    <w:lang w:val="en-NZ"/>
+                </w:rPr>
+            </w:pPr>
+            <w:r w:rsidRPr="00265260">
+                <w:rPr>
+                    <w:lang w:val="en-NZ"/>
+                </w:rPr>
+                <w:t>{% case bar %}</w:t>
+            </w:r>
+        </w:p>
+        <w:p w14:paraId="07D4BB28" w14:textId="77777777" w:rsidR="00265260" w:rsidRPr="00265260" w:rsidRDefault="00265260" w:rsidP="00265260">
+            <w:pPr>
+                <w:rPr>
+                    <w:lang w:val="en-NZ"/>
+                </w:rPr>
+            </w:pPr>
+            <w:r w:rsidRPr="00265260">
+                <w:rPr>
+                    <w:lang w:val="en-NZ"/>
+                </w:rPr>
+                <w:t>{</w:t>
+            </w:r>
+            <w:proofErr w:type="gramStart"/>
+            <w:r w:rsidRPr="00265260">
+                <w:rPr>
+                    <w:lang w:val="en-NZ"/>
+                </w:rPr>
+                <w:t>% :one</w:t>
+            </w:r>
+            <w:proofErr w:type="gramEnd"/>
+            <w:r w:rsidRPr="00265260">
+                <w:rPr>
+                    <w:lang w:val="en-NZ"/>
+                </w:rPr>
+                <w:t xml:space="preserve"> %}One thing.{% end %}</w:t>
+            </w:r>
+        </w:p>
+        <w:p w14:paraId="071C909A" w14:textId="77777777" w:rsidR="00265260" w:rsidRPr="00265260" w:rsidRDefault="00265260" w:rsidP="00265260">
+            <w:pPr>
+                <w:rPr>
+                    <w:lang w:val="en-NZ"/>
+                </w:rPr>
+            </w:pPr>
+            <w:r w:rsidRPr="00265260">
+                <w:rPr>
+                    <w:lang w:val="en-NZ"/>
+                </w:rPr>
+                <w:t>{</w:t>
+            </w:r>
+            <w:proofErr w:type="gramStart"/>
+            <w:r w:rsidRPr="00265260">
+                <w:rPr>
+                    <w:lang w:val="en-NZ"/>
+                </w:rPr>
+                <w:t>% :two</w:t>
+            </w:r>
+            <w:proofErr w:type="gramEnd"/>
+            <w:r w:rsidRPr="00265260">
+                <w:rPr>
+                    <w:lang w:val="en-NZ"/>
+                </w:rPr>
+                <w:t xml:space="preserve"> %}Second thing.{% end %}</w:t>
+            </w:r>
+        </w:p>
+        <w:p w14:paraId="6DE417B8" w14:textId="77777777" w:rsidR="00265260" w:rsidRPr="00265260" w:rsidRDefault="00265260" w:rsidP="00265260">
+            <w:pPr>
+                <w:rPr>
+                    <w:lang w:val="en-NZ"/>
+                </w:rPr>
+            </w:pPr>
+            <w:r w:rsidRPr="00265260">
+                <w:rPr>
+                    <w:lang w:val="en-NZ"/>
+                </w:rPr>
+                <w:t xml:space="preserve">{% t </w:t>
+            </w:r>
+            <w:proofErr w:type="gramStart"/>
+            <w:r w:rsidRPr="00265260">
+                <w:rPr>
+                    <w:lang w:val="en-NZ"/>
+                </w:rPr>
+                <w:t>%}Default</w:t>
+            </w:r>
+            <w:proofErr w:type="gramEnd"/>
+            <w:r w:rsidRPr="00265260">
+                <w:rPr>
+                    <w:lang w:val="en-NZ"/>
+                </w:rPr>
+                <w:t xml:space="preserve"> thing.{%end %}</w:t>
+            </w:r>
+        </w:p>
+        <w:p w14:paraId="626EDB63" w14:textId="77777777" w:rsidR="00265260" w:rsidRPr="00265260" w:rsidRDefault="00265260" w:rsidP="00265260">
+            <w:pPr>
+                <w:rPr>
+                    <w:lang w:val="en-NZ"/>
+                </w:rPr>
+            </w:pPr>
+            <w:r w:rsidRPr="00265260">
+                <w:rPr>
+                    <w:lang w:val="en-NZ"/>
+                </w:rPr>
+                <w:t>{% end %}</w:t>
+            </w:r>
+        </w:p>
+        <w:p w14:paraId="51E35462" w14:textId="77777777" w:rsidR="00265260" w:rsidRPr="00265260" w:rsidRDefault="00265260" w:rsidP="00265260">
+            <w:pPr>
+                <w:rPr>
+                    <w:lang w:val="en-NZ"/>
+                </w:rPr>
+            </w:pPr>
+            <w:r w:rsidRPr="00265260">
+                <w:rPr>
+                    <w:lang w:val="en-NZ"/>
+                </w:rPr>
+                <w:t xml:space="preserve">And now bar: </w:t>
+            </w:r>
+            <w:proofErr w:type="gramStart"/>
+            <w:r w:rsidRPr="00265260">
+                <w:rPr>
+                    <w:lang w:val="en-NZ"/>
+                </w:rPr>
+                <w:t>{{ bar</w:t>
+            </w:r>
+            <w:proofErr w:type="gramEnd"/>
+            <w:r w:rsidRPr="00265260">
+                <w:rPr>
+                    <w:lang w:val="en-NZ"/>
+                </w:rPr>
+                <w:t xml:space="preserve"> }}</w:t>
+            </w:r>
+        </w:p>
+        <w:p w14:paraId="22A855B7" w14:textId="19291144" w:rsidR="00361EE8" w:rsidRPr="00265260" w:rsidRDefault="00265260" w:rsidP="00265260">
+            <w:pPr>
+                <w:rPr>
+                    <w:lang w:val="en-NZ"/>
+                </w:rPr>
+            </w:pPr>
+            <w:r w:rsidRPr="00265260">
+                <w:rPr>
+                    <w:lang w:val="en-NZ"/>
+                </w:rPr>
+                <w:t>{% end %}</w:t>
+            </w:r>
+        </w:p>
+        <w:sectPr w:rsidR="00361EE8" w:rsidRPr="00265260">
+            <w:pgSz w:w="11906" w:h="16838"/>
+            <w:pgMar w:top="1417" w:right="1417" w:bottom="1417" w:left="1417" w:header="708" w:footer="708" w:gutter="0"/>
+            <w:cols w:space="708"/>
+            <w:docGrid w:linePitch="360"/>
+        </w:sectPr>
+    </w:body>
+</w:document>
+#+END_SRC
+
+WordprocessingML (WML) is pretty chatty. But in essence it's quite simple. The main document part of the ~docx~ package has a ~w:document~ element wrapping a ~w:body~ element. Within the ~w:body~ are a series of paragraphs (~w:p~); within the paragraphs are runs (~w:r~), and within the runs the text finally appears within text (~w:t~) elements. The ~w:sectPr~ element at the end contains information about the last (and, in our case, only) 'section'. The ~w:pPr~ are 'paragraph properties' and the ~w:rPr~ are 'run properties'. If whitespace is significant within a ~w:t~, the attribute ~xml:space~ is set to ~"preserve"~.
+
+The attributes on the ~w:p~ and ~w:r~ elements are there to help Word keep track of who edited what when, and the identity of text that is copied between documents or applications. We also notice that Word is helpfully indicating that '(:output' is grammatically incorrect.
+
+There are a couple of differences between this text and the original one where we were directly editing the source string:
+
+1. There is text before the opening ~{% template ... %}~ form and after the closing ~{% end %}~ form. This is significant because ~TEN/COMPILER:COMPILE-TEMPLATE~ ignores this text (so that it is ommitted from the template macro and resulting function).
+2. The template tags themselves are often (but not always) split into multiple WML elements.
+
+We note that:[fn::See [[https://github.com/elapouya/python-docx-template][python-docx-template]]]
+
+- the template tags will /disappear/ from the string that is output by the template function;
+- until that time, the text /does not have to be valid WML/.
+
+If we could pre-process the text such that it was acceptable to TEN, and such that the final string was acceptable to Word, we would achieve (part of) our goal. In the spirit of juggling chainsaws, we will reach for the most powerful and hardest to control tool for the job: regexps.
+
+* Cleaning Template Tags
+
+Our first job is to clean up any WML within the tags so they are in a state to be recognised by TEN. We'll use CL-PPCRE, and, so we have a hope of understanding our regexes, CL-INTERPOL.
+
+#+BEGIN_SRC lisp :noweb-ref defsystem-depends
+#:cl-ppcre
+#:cl-interpol
+#+END_SRC
+
+The interpol syntax needs to be enabled around our regex-hacking.
+
+#+BEGIN_SRC lisp :noweb-ref string-hacking
+
+#+END_SRC
+
+* Scaffolding
+
+** System Definition
+
+#+BEGIN_SRC lisp :noweb yes :tangle ten-x.asdf
+  (asdf:defsystem "ten-x"
+    <<defsystem-stuff>>
+    :depends-on (
+                 #:ten
+                 <<defsystem-depends>>
+                )
+    :serial t
+    :components (
+                 (:file "package")
+                 <<defsystem-components>>
+                 (:file "ten-x")
+                 )
+    :in-order-to ((asdf:test-op (asdf:test-op :ten-x.tests)))
+    )
+
+<<test-defsystem>>
+#+END_SRC
+
+** Package Definitions
+
+#+BEGIN_SRC lisp :noweb yes :tangle package.lisp
+  (cl:in-package #:cl)
+
+  (defpackage #:ten-x
+    (:use #:cl)
+    (:export
+     <<ten-x-exports>>
+     ))
+
+<<test-package>>
+#+END_SRC
+
+** Code
+
+#+BEGIN_SRC lisp :noweb yes :tangle ten-x.lisp
+(cl:in-package #:ten-x)
+
+#+END_SRC
+
+** Test Infrastructure
+
+#+BEGIN_SRC lisp :noweb-ref test-defsystem 
+  (asdf:defsystem "ten-x.tests"
+    :description "Tests for TEN-X"
+    :depends-on (#:ten-x #:parachute)
+    :serial t
+    :components ((:file "tests"))
+    :perform (asdf:test-op (op c) 
+                           (uiop:symbol-call #:ten-x-tests #:run-tests))) 
+#+END_SRC
+
+#+BEGIN_SRC lisp :noweb-ref test-package
+  (defpackage #:ten-x-tests
+    (:use #:cl #:ten #:parachute))
+#+END_SRC
+
+
