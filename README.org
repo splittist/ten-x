@@ -6,6 +6,7 @@ We're going to try to extend/repurpose Mario Montone's [[https://github.com/mmon
 
 For example, we should be able to take a contract written in Word and mark it up with TEN constructs to allow us to use it in mulitiple contexts. More simply, the following Word document:
 
+#+BEGIN_QUOTE
 {% template dunning-letter () (deadbeat sum-owed) %}
 Dear {{ deadbeat }},
 
@@ -13,6 +14,7 @@ You owe us{% if (> sum-owed 100) %} *a lot of* {% else %} some {% end %}money. P
 
 /The Management/
 {% end %}
+#+END_QUOTE
 
 when compiled as a template and rendered with various arguments should yield the expected ~docx~ file. (We may find we have to tweak the syntax, add an option or two etc.)
 
@@ -439,14 +441,25 @@ There are a couple of differences between this text and the original one where w
 
 We note that:[fn::See [[https://github.com/elapouya/python-docx-template][python-docx-template]]]
 
-- the template tags will /disappear/ from the string that is output by the template function;
+- the template tags will /disappear/ from the string that is output by the template function (the output tags --- those delimited by '{{' and '}}' --- being replaced by a (possibly empty) string);
 - until that time, the text /does not have to be valid WML/.
 
 If we could pre-process the text such that it was acceptable to TEN, and such that the final string was acceptable to Word, we would achieve (part of) our goal. In the spirit of juggling chainsaws, we will reach for the most powerful and hardest to control tool for the job: regexps.
 
 * Cleaning Template Tags
 
-Our first job is to clean up any WML within the tags so they are in a state to be recognised by TEN. We'll use CL-PPCRE, and, so we have a hope of understanding our regexes, CL-INTERPOL.
+** The plan
+
+Our first job is to clean up any WML within the tags so they are in a state to be recognised by TEN. We'll do this in stages:
+
+1. Strip WML between delimiters
+2. Strip WML within delimiters
+
+One more thing. We need to make sure that characters within our tags are the characters lisp is expecting. In particular, we need to make sure quotes and apostrophes are not 'smart' quotes or apostrophes.
+
+3. Fix quotes
+
+We'll use CL-PPCRE, and, so we have a hope of understanding our regexes, CL-INTERPOL.
 
 #+BEGIN_SRC lisp :noweb-ref defsystem-depends
 #:cl-ppcre
@@ -455,15 +468,233 @@ Our first job is to clean up any WML within the tags so they are in a state to b
 
 The interpol syntax needs to be enabled around our regex-hacking.
 
-#+BEGIN_SRC lisp :noweb-ref string-hacking
+#+BEGIN_SRC lisp :noweb yes :noweb-ref string-hacking
+  (cl-interpol:enable-interpol-syntax)
+
+  <<regex-hacking>>
+
+  (cl-interpol:disable-interpol-syntax)
+#+END_SRC
+
+** Strip WML between delimiters
+
+First, we'll look for all the open braces ('{') followed by one or more WML tags (things starting with a '<' and ending with a '>') and then another brace or a percent-sign ('%'). (TEN only has two opening tag delimeters: '{{' and '{%'.) The WML tags will be deleted. The same procedure works for the closing delimiters ('}}' and '%}').
+
+We want our function to work for opening delimiters and closing delimiters, for output tags and control tags, and when there is more than one tag.
+
+#+BEGIN_SRC lisp :noweb-ref tests
+  (define-test strip-wml-tags-between-delimiters
+    :parent all
+    (is string=
+	"<w:r><w:t>{{ vrbl </w:t></w:r><w:r><w:t>}}</w:t></w:r>"
+	(ten-x::strip-wml-tags-between-delimiters "<w:r><w:t>{</w:t></w:r><w:r><w:t xml:space=\"preserve\">{ vrbl </w:t></w:r><w:r><w:t>}</w:t><w:t>}</w:t></w:r>"))
+    (is string=
+	"<w:r><w:t>{% vrbl </w:t></w:r><w:r><w:t>%}</w:t></w:r>"
+	(ten-x::strip-wml-tags-between-delimiters "<w:r><w:t>{</w:t></w:r><w:r><w:t xml:space=\"preserve\">% vrbl </w:t></w:r><w:r><w:t>%</w:t><w:t>}</w:t></w:r>"))
+    (is string=
+	"<w:r><w:t>{{ vrbl </w:t></w:r><w:r><w:t>}}</w:t></w:r><w:r><w:t>{{ vrbl </w:t></w:r><w:r><w:t>}}</w:t></w:r>"
+	(ten-x::strip-wml-tags-between-delimiters "<w:r><w:t>{</w:t></w:r><w:r><w:t xml:space=\"preserve\">{ vrbl </w:t></w:r><w:r><w:t>}</w:t><w:t>}</w:t></w:r><w:r><w:t>{</w:t></w:r><w:r><w:t xml:space=\"preserve\">{ vrbl </w:t></w:r><w:r><w:t>}</w:t><w:t>}</w:t></w:r>")))
+#+END_SRC
+
+In terms of CL-PPCRE, we look-behind for the '{', capture the elements until we see the '{' or '%', then replace the group with the empty string, and a similar thing for the closing pairs.
+
+#+BEGIN_SRC lisp :noweb-ref regex-hacking
+  (defun strip-wml-tags-between-delimiters (str)
+    (cl-ppcre:regex-replace-all
+     #?rx"
+       (?s)          # . matches #\Newline
+       (?<={)        # just seen a #\{
+       (<[^>]*>)+    # followed by one or more element-like things
+       (?=[\{%])     #  and a #\{ or #\%
+       |             # or
+       (?<=[%}])     # just seen a #\} or #\%
+       (<[^>]*>)+    # followed by one or more tag-like things
+       (?=\})        #  and a #\}
+     "
+     str 
+     ""))
 
 #+END_SRC
+
+And our tests pass. Ship it!
+
+** Strip WML within delimiters
+
+The next job is to remove the WML tags that Word has introduced within the template tags:
+
+#+BEGIN_SRC lisp :noweb-ref tests
+  (define-test test-strip-wml-tags-within-delimiters
+    :parent all
+    (is string=
+	"<w:r><w:t>{{ vrbl }}</w:t></w:r>"
+	(ten-x::strip-wml-tags-within-delimiters "<w:r><w:t>{{ vrbl </w:t></w:r><w:r><w:t>}}</w:t></w:r>"))
+    (is string=
+	"<w:r><w:t>{% vrbl %}</w:t></w:r>"
+	(ten-x::strip-wml-tags-within-delimiters "<w:r><w:t>{% vrbl </w:t></w:r><w:r><w:t>%}</w:t></w:r>"))
+    (is string=
+	"<w:r><w:t>{{ vrbl }}</w:t></w:r><w:r><w:t>{{ vrbl }}</w:t></w:r>"
+	(ten-x::strip-wml-tags-within-delimiters "<w:r><w:t>{{ vrbl </w:t></w:r><w:r><w:t>}}</w:t></w:r><w:r><w:t>{{ vrbl </w:t></w:r><w:r><w:t>}}</w:t></w:r>")))
+#+END_SRC
+
+Again we use ~REGEX-REPLACE-ALL~, but in two steps:
+
+1. We capture the text between (but not including) the delimiters, and, using the ~:simple-calls~ facility, replace it with the result of the second step;
+2. We capture the first closing text tag (~</w:t>~) and everything up to, and including, the next opening text tag, and replace it with the empty string, repeatedly. We look for the /closing/ text tag at the beginning because there will be an opening tag on the outside of the opening delimiter. Similarly, we end with capturing (and deleting) the /opening/ text tag at the end because there will be a closing tag on the outside of the closing delimiter. We continue until there are no more clumps of 'closing+opening' WML tags left.
+
+As a result, the only thing left /within/ the delimiters will be the text we put there. (Since we know we are only putting text --- as opposed to images, math markup, hyperlinks, footnotes etc. --- inside our template tags we only have to look for ~w:t~ elements.)
+
+#+BEGIN_SRC lisp :noweb-ref regex-hacking
+  (defun strip-wml-tags-within-delimiters (str)
+    (flet ((stags (match)
+	     (cl-ppcre:regex-replace-all
+	      #?rx"
+		(?s)                 # . matches #\Newline
+		</w:t>               # closing text tag
+		.*?                  # non-greedy anything up to
+		(<w:t>|<w:t [^>]*>)  # and including, next opening text tag
+		"
+	      match
+	      "")))
+      (cl-ppcre:regex-replace-all
+       #?rx"
+	  (?s)               # . matches #\Newline
+	  {{                 # opening pair
+	  (?:(?!}}).)*       # any amount of thing until looking at closing pair (not included)
+	  |
+	  {%(?:(?!%}).)*     # same for {% tags
+	  "
+       str
+       #'stags
+       :simple-calls t)))
+#+END_SRC
+
+By deleting everything from (and including) the closing text tag up to (and including) the next opening text tag, we also delete the corresponding closing and opening run (~w:r~) tags. Consequently, the entire template tag will be enclosed in the WML text tag --- and, therefore, run --- that previously enclosed the opening brace. The formatting applied to that run will now be applied to whatever replaces the template tag (nothing in the case of a control tag; the string in the case of an output tag). We should probably mention this fact to template authors.
+
+** Fix quotes
+
+Fixing the quotes is a simple matter of substitution. The only (minor) complication is that we only want to make the changes to text within the template tags.
+
+#+BEGIN_SRC lisp :noweb-ref tests
+  (define-test test-fix-quotes
+    :parent all
+    (is string=
+	"“”‘’{{ \"\"'' }}"
+	(ten-x::fix-quotes "“”‘’{{ “”‘’ }}")))
+#+END_SRC
+
+In terms of implementation, we'll do the simplest possible thing, but take the time to separately define the regex that captures all the template tags.
+
+#+BEGIN_SRC lisp :noweb-ref regex-hacking
+  (defparameter +all-the-tags+
+     #?rx"
+       (?s)
+       {{                 # opening pair
+       (?:(?!}}).)*       # any amount of thing until looking at closing pair
+       }}                 # the closing pair
+       |
+       {%(?:(?!%}).)*%}    # same for {% tags
+       ")
+
+  (defun fix-quotes (str)
+    (let ((sublist '((#\" . #\“) (#\" . #\”) (#\' . #\‘) (#\' . #\’))))
+      (flet ((subs (match)
+	       (dolist (pair sublist match)
+		 (setf match (substitute (car pair) (cdr pair) match)))))
+	(cl-ppcre:regex-replace-all
+	 +all-the-tags+
+	 str
+	 #'subs
+	 :simple-calls t))))
+#+END_SRC
+
+Of course, this loses if the template author has deliberately included literal smartquotes inside their tags. But what are the chances of that?
+
+** Taking stock
+
+We've achieved what we set out to do. But how far does that actually get us? Let's look at some contrived examples (without much of the Word noise). We'll assume we've solved the issue of having the ~template~ form wrap the whole of the output.
+
+The following contrived example:
+
+#+BEGIN_EXAMPLE
+{% template foo (:output-whitespace nil) (episode) %}
+<body><p><r><t>Luke, I am your {% if (< episode 15) %}father{% else %}plumber{% end %}</t></r></p></body>
+{% end %}
+#+END_EXAMPLE
+
+expands as expected:
+
+#+BEGIN_SRC lisp
+((TEMPLATE TEN-TEMPLATES::FOO (:OUTPUT-WHITESPACE NIL) (TEN-TEMPLATES::EPISODE)
+           (WRITE-STRING "
+<body><p><r><t>Luke, I am your "
+                         TEN/TEMPLATE:%TEN-STREAM)
+           (IF (< TEN-TEMPLATES::EPISODE 15)
+               (PROGN (WRITE-STRING "father" TEN/TEMPLATE:%TEN-STREAM))
+               (PROGN (WRITE-STRING "plumber" TEN/TEMPLATE:%TEN-STREAM)))
+           (WRITE-STRING "</t></r></p></body>
+"
+                         TEN/TEMPLATE:%TEN-STREAM)))
+#+END_SRC
+
+But this version:
+
+#+BEGIN_EXAMPLE
+{% template foo (:output-whitespace nil) (episode) %}
+<body>
+  <p><r><t>Luke, use the:</t></r></p>
+  <p><r><t>{% case episode %}</t></r></p>
+  <p><r><t>{% 4 %}force{% end %}</t></r></p>
+  <p><r><t>{% 9 %}comb{% end %}</t></r></p>
+  <p><r><t>{% t %}plunger{% end %}</t></r></p>
+  <p><r><t>{% end %}</t></r></p>
+</body>
+{% end %}
+#+END_EXAMPLE
+
+yields the syntactically incorrect:
+
+#+BEGIN_SRC lisp
+((TEMPLATE TEN-TEMPLATES:FOO (:OUTPUT-WHITESPACE NIL) (TEN-TEMPLATES::EPISODE)
+           (WRITE-STRING "
+<body>
+  <p><r><t>Luke, use the:</t></r></p>
+  <p><r><t>"
+                         TEN/TEMPLATE:%TEN-STREAM)
+           (CASE TEN-TEMPLATES::EPISODE
+             (WRITE-STRING
+              "</t></r></p>
+  <p><r><t>"
+              TEN/TEMPLATE:%TEN-STREAM)
+             (4 (WRITE-STRING "force" TEN/TEMPLATE:%TEN-STREAM))
+             (WRITE-STRING
+              "</t></r></p>
+  <p><r><t>"
+              TEN/TEMPLATE:%TEN-STREAM)
+             (9 (WRITE-STRING "comb" TEN/TEMPLATE:%TEN-STREAM))
+             (WRITE-STRING
+              "</t></r></p>
+  <p><r><t>"
+              TEN/TEMPLATE:%TEN-STREAM)
+             (T (WRITE-STRING "plunger" TEN/TEMPLATE:%TEN-STREAM))
+             (WRITE-STRING
+              "</t></r></p>
+  <p><r><t>"
+              TEN/TEMPLATE:%TEN-STREAM))
+           (WRITE-STRING "</t></r></p>
+</body>
+"
+                         TEN/TEMPLATE:%TEN-STREAM)))
+#+END_SRC
+
+Of course it does. While /we/ know that the WML tags (the '~<p><r><t>...</t></r></p>~') wrapping the ~CASE~ keyform control tag pairs are 'whitespace', TEN doesn't.
+
+- unbalanced proofErr
 
 * Scaffolding
 
 ** System Definition
 
-#+BEGIN_SRC lisp :noweb yes :tangle ten-x.asdf
+#+BEGIN_SRC lisp :noweb yes :tangle ten-x.asd
   (asdf:defsystem "ten-x"
     <<defsystem-stuff>>
     :depends-on (
@@ -493,13 +724,14 @@ The interpol syntax needs to be enabled around our regex-hacking.
      <<ten-x-exports>>
      ))
 
-<<test-package>>
 #+END_SRC
 
 ** Code
 
 #+BEGIN_SRC lisp :noweb yes :tangle ten-x.lisp
-(cl:in-package #:ten-x)
+  (cl:in-package #:ten-x)
+
+  <<string-hacking>>
 
 #+END_SRC
 
@@ -516,8 +748,21 @@ The interpol syntax needs to be enabled around our regex-hacking.
 #+END_SRC
 
 #+BEGIN_SRC lisp :noweb-ref test-package
-  (defpackage #:ten-x-tests
-    (:use #:cl #:ten #:parachute))
+  (cl:defpackage #:ten-x-tests
+    (:use #:cl #:ten #:parachute)
+    (:export #:run-tests))
 #+END_SRC
 
+#+BEGIN_SRC lisp :noweb yes :tangle tests.lisp
+  <<test-package>>
 
+  (cl:in-package #:ten-x-tests)
+
+  (defun run-tests ()
+    (test 'all))
+
+  (define-test all)
+
+  <<tests>>
+
+#+END_SRC
